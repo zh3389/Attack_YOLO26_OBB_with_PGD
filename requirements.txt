@@ -1,0 +1,4 @@
+ultralytics
+torchattacks
+matplotlib
+numpy<2.0

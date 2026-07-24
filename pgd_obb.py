@@ -1,36 +1,3 @@
-"""
-PGD 攻击 YOLO OBB 旋转框检测脚本。
-
-支持三种攻击模式:
-  --mode miss  : 漏检攻击 (压低所有 anchor 置信度，隐藏目标)
-  --mode cls   : 分类攻击 (让 top-k anchor 预测类别偏离)
-  --mode angle : 角度攻击 (偏转 top-k anchor 的旋转角度)
-
-用法示例:
-  python pgd_obb.py \
-      --weight_path yolo_obb.pt \
-      --image_dir ./test_images \
-      --img_size 1024 \
-      --mode miss \
-      --steps 10
-
-  python pgd_obb.py \
-      --weight_path yolo_obb.pt \
-      --image_dir ./test_images \
-      --img_size 1024 \
-      --mode cls \
-      --steps 10 \
-      --topk 50
-
-  python pgd_obb.py \
-      --weight_path yolo_obb.pt \
-      --image_dir ./test_images \
-      --img_size 1024 \
-      --mode angle \
-      --steps 10 \
-      --topk 50
-"""
-
 import argparse
 import os
 import torch
@@ -187,7 +154,7 @@ class SimpleImageDataset(Dataset):
 # ==========================================
 # 3. 评估函数
 # ==========================================
-def evaluate_attack(nn_model, images, adv_images, args, device):
+def evaluate_attack(nn_model, images, adv_images, mode, topk, device):
     """根据不同 attack 模式评估攻击效果并打印统计信息"""
     with torch.no_grad():
         clean_out = nn_model(images)
@@ -206,28 +173,28 @@ def evaluate_attack(nn_model, images, adv_images, args, device):
     max_clean, pred_clean = clean_scores.max(dim=1)  # [B, N]
     max_adv, pred_adv = adv_scores.max(dim=1)
 
-    if args.mode == 'miss':
+    if mode == 'miss':
         # 漏检: 打印置信度下降幅度
         for b in range(B):
             c = max_clean[b].mean().item()
             a = max_adv[b].mean().item()
             print(f"  Image {b}: Clean Score {c:.4f} -> Adv Score {a:.4f} (Drop: {c - a:.4f})")
 
-    elif args.mode == 'cls':
+    elif mode == 'cls':
         # 分类: 统计 top-k anchor 类别翻转率
-        k = min(args.topk, max_clean.shape[1])
+        k = min(topk, max_clean.shape[1])
         _, topk_idx = max_clean.topk(k, dim=1)  # [B, K]
         for b in range(B):
             idx = topk_idx[b]
             changed = (pred_clean[b, idx] != pred_adv[b, idx]).sum().item()
             print(f"  Image {b}: Top-{k} class flip rate = {changed / k:.2%}")
 
-    elif args.mode == 'angle':
+    elif mode == 'angle':
         # 角度: 打印角度绝对值变化
         clean_angle = clean_head['angle']  # [B, 1, N]
         adv_angle = adv_head['angle']
 
-        k = min(args.topk, max_clean.shape[1])
+        k = min(topk, max_clean.shape[1])
         _, topk_idx_clean = max_clean.topk(k, dim=1)
         _, topk_idx_adv = max_adv.topk(k, dim=1)
         for b in range(B):
@@ -239,51 +206,10 @@ def evaluate_attack(nn_model, images, adv_images, args, device):
 # ==========================================
 # 4. 主函数
 # ==========================================
-def main():
-    parser = argparse.ArgumentParser(
-        description="YOLO OBB PGD Attack Tool",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-示例:
-  # 漏检攻击
-  python pgd_obb.py --weight_path yolo_obb.pt --image_dir ./test_images --mode miss
-
-  # 分类攻击 (top-50 anchor)
-  python pgd_obb.py --weight_path yolo_obb.pt --image_dir ./test_images --mode cls --topk 50
-
-  # 角度攻击
-  python pgd_obb.py --weight_path yolo_obb.pt --image_dir ./test_images --mode angle --topk 50
-        """
-    )
-    parser.add_argument('--weight_path', type=str, required=True,
-                        help='YOLO OBB .pt 权重路径')
-    parser.add_argument('--image_dir', type=str, default='./test_images',
-                        help='测试图片目录')
-    parser.add_argument('--img_size', type=int, default=1024,
-                        help='YOLO 输入尺寸 (640/1024)')
-    parser.add_argument('--batch_size', type=int, default=2,
-                        help='Batch size (OBB 显存大，建议 1-2)')
-
-    # 攻击模式
-    parser.add_argument('--mode', type=str, default='miss',
-                        choices=['miss', 'cls', 'angle'],
-                        help='攻击模式: miss=漏检, cls=分类混淆, angle=角度偏转')
-
-    # PGD 参数
-    parser.add_argument('--eps', type=float, default=8.0 / 255.0,
-                        help='最大扰动幅度')
-    parser.add_argument('--alpha', type=float, default=2.0 / 255.0,
-                        help='每步步长')
-    parser.add_argument('--steps', type=int, default=10,
-                        help='迭代步数')
-    parser.add_argument('--topk', type=int, default=50,
-                        help='cls/angle 模式下的 top-k anchor 数量')
-
-    args = parser.parse_args()
-
+def main(weight_path, image_dir, output_dir, img_size, batch_size, mode, alpha, eps, steps, topk):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
-    print(f"Mode: {args.mode} | Steps: {args.steps}")
+    print(f"Mode: {mode} | Steps: {steps}")
 
     # ---- 加载模型 ----
     try:
@@ -291,48 +217,48 @@ def main():
     except ImportError:
         raise ImportError("请安装 ultralytics: pip install ultralytics")
 
-    print(f"Loading YOLO OBB model: {args.weight_path}")
-    yolo_wrapper = YOLO(args.weight_path)
+    print(f"Loading YOLO OBB model: {weight_path}")
+    yolo_wrapper = YOLO(weight_path)
     nn_model = yolo_wrapper.model
     nn_model.to(device)
     nn_model.train()  # train 模式获取可微 raw prediction
 
     # ---- 准备数据 ----
-    if not os.path.exists(args.image_dir):
-        os.makedirs(args.image_dir)
-        print(f"[Warn] {args.image_dir} 不存在，已创建。请放入图片后重试。")
+    if not os.path.exists(image_dir):
+        os.makedirs(image_dir)
+        print(f"[Warn] {image_dir} 不存在，已创建。请放入图片后重试。")
         return
 
     image_paths = sorted([
-        os.path.join(args.image_dir, f)
-        for f in os.listdir(args.image_dir)
+        os.path.join(image_dir, f)
+        for f in os.listdir(image_dir)
         if f.lower().endswith(('.jpg', '.jpeg', '.png'))
     ])
     if not image_paths:
-        print(f"[Error] {args.image_dir} 中未找到图片。")
+        print(f"[Error] {image_dir} 中未找到图片。")
         return
     print(f"Found {len(image_paths)} images")
 
-    dataset = SimpleImageDataset(image_paths, img_size=args.img_size)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
+    dataset = SimpleImageDataset(image_paths, img_size=img_size)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
     # ---- 初始化 PGD 攻击 ----
     atk = YOLOBB_PGD(
         nn_model,
-        eps=args.eps,
-        alpha=args.alpha,
-        steps=args.steps,
+        eps=eps,
+        alpha=alpha,
+        steps=steps,
         random_start=True,
-        mode=args.mode,
-        topk=args.topk,
+        mode=mode,
+        topk=topk,
     )
 
     mode_desc = {'miss': '漏检 (evasion)', 'cls': '分类混淆 (misclassification)',
                  'angle': '角度偏转 (angle deflection)'}
-    print(f"\nPGD Attack: {mode_desc[args.mode]}")
-    print(f"Eps={args.eps:.4f}  Alpha={args.alpha:.4f}  Steps={args.steps}")
+    print(f"\nPGD Attack: {mode_desc[mode]}")
+    print(f"Eps={eps:.4f}  Alpha={alpha:.4f}  Steps={steps}")
 
-    os.makedirs("adv_outputs", exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
 
     # ---- 执行攻击 ----
     for batch_idx, (images, paths) in enumerate(dataloader):
@@ -343,7 +269,7 @@ def main():
         adv_images = atk(images)
 
         # 评估
-        evaluate_attack(nn_model, images, adv_images, args, device)
+        evaluate_attack(nn_model, images, adv_images, mode, topk, device)
 
         # 保存对抗图片
         for i in range(adv_images.shape[0]):
@@ -352,10 +278,83 @@ def main():
             adv_np = cv2.cvtColor(adv_np, cv2.COLOR_RGB2BGR)
 
             save_name = os.path.basename(paths[i])
-            cv2.imwrite(f"adv_outputs/pgd_{args.mode}_{save_name}", adv_np)
+            cv2.imwrite(f"{output_dir}/{save_name}", adv_np)
 
-    print(f"\nDone! Results saved to ./adv_outputs/pgd_{args.mode}_*")
+    print(f"\nDone! Results saved to {output_dir}/*.jpg")
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description="YOLO OBB PGD Attack Tool",
+                                    formatter_class=argparse.RawDescriptionHelpFormatter, epilog="""
+                                    示例:
+                                    # 漏检攻击
+                                    python pgd_obb.py --weight_path yolo_obb.pt --image_dir ./test_images --mode miss
+                                    # 分类攻击 (top-50 anchor)
+                                    python pgd_obb.py --weight_path yolo_obb.pt --image_dir ./test_images --mode cls --topk 50
+                                    # 角度攻击
+                                    python pgd_obb.py --model yolo_obb.pt --data ./test_images --mode angle --topk 50
+                                    """
+    )
+    parser.add_argument('--model', type=str, required=True, help='YOLO OBB .pt 权重路径')
+    parser.add_argument('--data', type=str, default='./test_images', help='测试图片目录')
+    parser.add_argument('--output', type=str, default='./adv_outputs', help='保存对抗样本的文件夹路径')
+    parser.add_argument('--img_size', type=int, default=1024, help='YOLO 输入尺寸 (640/1024)')
+    parser.add_argument('--batch_size', type=int, default=2, help='Batch size (OBB 显存大，建议 1-2)')
+    # 攻击模式
+    parser.add_argument('--mode', type=str, default='angle', choices=['miss', 'cls', 'angle'], help='攻击模式: miss=漏检, cls=分类混淆, angle=角度偏转')
+    # PGD 参数
+    parser.add_argument('--eps', type=float, default=8.0 / 255.0, help='最大扰动幅度')
+    parser.add_argument('--alpha', type=float, default=2.0 / 255.0, help='每步步长')
+    parser.add_argument('--steps', type=int, default=10, help='迭代步数')
+    parser.add_argument('--topk', type=int, default=50, help='cls/angle 模式下的 top-k anchor 数量')
+    args = parser.parse_args()
+    main(weight_path=args.model,
+         image_dir=args.data,
+         output_dir=args.output,
+         img_size=args.img_size,
+         batch_size=args.batch_size,
+         mode=args.mode,
+         eps=args.eps,
+         alpha=args.alpha,
+         steps=args.steps,
+         topk=args.topk)
+
+
+"""
+PGD 攻击 YOLO OBB 旋转框检测脚本。
+
+支持三种攻击模式:
+  --mode miss  : 漏检攻击 (压低所有 anchor 置信度，隐藏目标)
+  --mode cls   : 分类攻击 (让 top-k anchor 预测类别偏离)
+  --mode angle : 角度攻击 (偏转 top-k anchor 的旋转角度)
+
+用法示例:
+python pgd_obb.py \
+    --model ./weights/best.pt \
+    --data ./dataset/images \
+    --output ./adv_outputs \
+    --img_size 1024 \
+    --mode miss \
+    --batch_size 2 \
+    --steps 10
+
+python pgd_obb.py \
+    --model ./weights/best.pt \
+    --data ./dataset/images \
+    --output ./adv_outputs \
+    --img_size 1024 \
+    --mode cls \
+    --batch_size 2 \
+    --steps 10 \
+    --topk 50
+
+python pgd_obb.py \
+    --model ./weights/best.pt \
+    --data ./dataset/images \
+    --output ./adv_outputs \
+    --img_size 1024 \
+    --mode angle \
+    --batch_size 2 \
+    --steps 10 \
+    --topk 50
+"""
